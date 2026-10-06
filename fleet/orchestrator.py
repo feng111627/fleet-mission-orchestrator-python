@@ -115,8 +115,9 @@ class Orchestrator:
             victim.state = TaskState.READY  # 被抢占任务回退为待调度，不消耗重试次数
 
     def _pick_preemption_victim(self, mission: Mission, task: Task, reason: DispatchFailure) -> Task | None:
+        # 抢占是全局的：低优先级的活动任务可能属于其他 mission
         candidates = [
-            t for t in mission.tasks.values()
+            t for m in self.store.missions.values() for t in m.tasks.values()
             if t.state in ACTIVE_STATES and t.spec.priority < task.spec.priority
         ]
         if reason == DispatchFailure.RESOURCE_BUSY:

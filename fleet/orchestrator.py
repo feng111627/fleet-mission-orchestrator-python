@@ -123,7 +123,9 @@ class Orchestrator:
                 if task.status != TaskStatus.READY:
                     continue  # 可能在本轮被抢占逻辑改动
                 robot, reason = self._scheduler.pick_robot(task)
-                if robot is None and reason is not None and reason.value == "robot_busy":
+                if robot is None and reason is not None and reason.value in (
+                        "robot_busy", "zone_occupied"):
+                    # 机器人全忙或作业区被占时，尝试抢占更低优先级的任务
                     if self._try_preempt(task):
                         robot, reason = self._scheduler.pick_robot(task)
                 if robot is None:

@@ -1,12 +1,13 @@
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from fleet.api import create_app
+
+app = create_app()
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"service": "fleet-mission-orchestrator", "status": "ok"}
 
 
 if __name__ == "__main__":

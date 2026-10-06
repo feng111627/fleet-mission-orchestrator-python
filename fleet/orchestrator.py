@@ -142,8 +142,9 @@ class Orchestrator:
         if task.robot_id is not None:
             robot = self.store.robots.get(task.robot_id)
             if robot is not None and robot.current_task_id == task.spec.task_id:
-                robot.state = RobotState.IDLE
                 robot.current_task_id = None
+                if robot.state == RobotState.BUSY:
+                    robot.state = RobotState.IDLE  # OFFLINE/FAULT 状态保持不变
         task.robot_id = None
         task.state = new_state
         task.last_error = error

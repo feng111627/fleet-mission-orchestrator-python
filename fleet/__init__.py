@@ -1,7 +1,6 @@
 from .errors import (
     DependencyCycleError,
     DispatchRejected,
-    DuplicateSubmission,
     OrchestratorError,
     RejectReason,
     UnknownRobotError,
@@ -15,7 +14,6 @@ from .store import StateStore
 __all__ = [
     "DependencyCycleError",
     "DispatchRejected",
-    "DuplicateSubmission",
     "FaultPolicy",
     "MIN_BATTERY",
     "Orchestrator",

@@ -17,14 +17,6 @@ class OrchestratorError(Exception):
     """业务错误基类。"""
 
 
-class DuplicateSubmission(OrchestratorError):
-    """幂等键已存在（通常由调用方选择忽略并复用首次结果）。"""
-
-    def __init__(self, idempotency_key: str):
-        self.idempotency_key = idempotency_key
-        super().__init__(f"duplicate submission: {idempotency_key}")
-
-
 class DependencyCycleError(OrchestratorError):
     """任务依赖成环。"""
 

@@ -20,7 +20,8 @@ class Scheduler:
         规则：
         1. 必须具备任务所需能力，否则 NO_CAPABLE_ROBOT；
         2. 候选中电量须 >= MIN_BATTERY，否则 BATTERY_TOO_LOW；
-        3. 作业区须空闲，否则 ZONE_OCCUPIED；
+        3. 任务声明的所有作业区必须同时空闲，否则 ZONE_OCCUPIED
+           （多区任务不会被部分分配）；
         4. 机器人须 IDLE，全部繁忙则 ROBOT_BUSY；
         5. 多个合格候选时取电量最高者（并列取 robot_id 字典序小者，保证确定性）。
         """
@@ -37,9 +38,11 @@ class Scheduler:
         if not charged:
             return None, RejectReason.BATTERY_TOO_LOW
 
-        zone = store.zones.get(task.zone)
-        if zone is not None and not zone.free and zone.occupied_by != task.task_id:
-            return None, RejectReason.ZONE_OCCUPIED
+        # 原子占用前提：所需作业区必须全部空闲，一个都不能被别的任务占着
+        for zid in task.required_zones:
+            zone = store.zones.get(zid)
+            if zone is not None and not zone.free and zone.occupied_by != task.task_id:
+                return None, RejectReason.ZONE_OCCUPIED
 
         idle = [r for r in charged if r.available]
         if not idle:

@@ -37,6 +37,7 @@ class TaskIn(BaseModel):
     dependencies: list[str] = []
     fault_policy: FaultPolicy = FaultPolicy.RETRY
     max_retries: int = 2
+    zones: list[str] | None = None  # 需同时独占的一组作业区；不传则只占 zone（老用法）
 
 
 class GraphIn(BaseModel):
@@ -125,7 +126,10 @@ def state():
     with s.lock:
         return {
             "tasks": {t.task_id: {"status": t.status.value, "robot": t.robot_id,
-                                  "retries": t.retries, "error": t.error}
+                                  "retries": t.retries, "error": t.error,
+                                  "zones": t.required_zones,
+                                  "blocked_resource": t.blocked_resource,
+                                  "blocked_by": t.blocked_by}
                       for t in s.tasks.values()},
             "robots": {r.robot_id: {"status": r.status.value, "battery": r.battery,
                                     "current_task": r.current_task}

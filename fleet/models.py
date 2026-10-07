@@ -35,16 +35,32 @@ TERMINAL_STATUSES = {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELL
 class Task:
     task_id: str
     capability: str            # 所需能力标签，如 "delivery" / "cleaning"
-    zone: str                  # 需要独占的作业区
+    zone: str                  # 需要独占的主作业区（老用法，单区任务继续使用）
     priority: int = 0          # 数值越大优先级越高
     dependencies: list[str] = field(default_factory=list)
     fault_policy: FaultPolicy = FaultPolicy.RETRY
     max_retries: int = 2
+    zones: list[str] | None = None  # 需要同时独占的一组作业区（多区任务）；None 时按 [zone] 处理
     status: TaskStatus = TaskStatus.PENDING
     retries: int = 0
     robot_id: str | None = None
     error: str | None = None
+    blocked_resource: str | None = None  # 派发受阻时卡住的资源（作业区/机器人 id）
+    blocked_by: str | None = None        # 占用该资源的任务 id
     created_at: float = field(default_factory=time.time)
+
+    @property
+    def required_zones(self) -> list[str]:
+        """任务需要一次性全部独占的作业区列表（去重、保序）。
+
+        - 老用法（只给 zone）：返回 [zone]；
+        - 新用法（给 zones）：以 zones 为准，并自动纳入 zone 兼容字段。
+        """
+        ordered: list[str] = [self.zone]
+        for z in (self.zones or []):
+            if z not in ordered:
+                ordered.append(z)
+        return ordered
 
 
 @dataclass

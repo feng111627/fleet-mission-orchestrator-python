@@ -110,9 +110,14 @@ class Orchestrator:
                 t.status = TaskStatus.READY
                 logger.info("task ready: %s", t.task_id)
 
-    # ---- 派发（含抢占） ----
+    # ---- 派发（含精确抢占） ----
     def dispatch_ready(self) -> list[str]:
-        """按优先级从高到低派发 READY 任务；全部繁忙时尝试抢占低优先级任务。"""
+        """按优先级从高到低派发 READY 任务。
+
+        每个任务先经 Scheduler 生成只读规划，再在同一把锁内原子执行：
+        需要抢占多个任务时先确认全部可抢（严格低优先级），然后一次性全部抢占，
+        再把该任务的整组作业区与机器人原子占上；任一挡路者不可抢则整体不动。
+        """
         dispatched: list[str] = []
         with self._store.lock:
             ready = sorted(
@@ -121,36 +126,62 @@ class Orchestrator:
             )
             for task in ready:
                 if task.status != TaskStatus.READY:
-                    continue  # 可能在本轮被抢占逻辑改动
-                robot, reason = self._scheduler.pick_robot(task)
-                if robot is None and reason is not None and reason.value in (
-                        "robot_busy", "zone_occupied"):
-                    # 机器人全忙或作业区被占时，尝试抢占更低优先级的任务
-                    if self._try_preempt(task):
-                        robot, reason = self._scheduler.pick_robot(task)
-                if robot is None:
-                    task.error = reason.value if reason else "unknown"
-                    logger.info("dispatch rejected: %s reason=%s", task.task_id, task.error)
+                    continue  # 可能在本轮被更早的高优任务抢占
+                plan = self._scheduler.plan_dispatch(task)
+                if not plan.accepted:
+                    task.error = plan.reason.value if plan.reason else "unknown"
+                    task.blocked_resource = plan.resource
+                    logger.info("dispatch rejected: %s reason=%s resource=%s",
+                                task.task_id, task.error, plan.resource)
                     continue
-                self._assign(task, robot)
+                # 规划已保证 preempt 中的任务全部严格低优先级；这里原子执行
+                for victim in plan.preempt:
+                    if victim.status in (TaskStatus.DISPATCHED, TaskStatus.PAUSED):
+                        self._preempt_victim(victim, by=task)
+                self._assign(task, plan.robot)
                 dispatched.append(task.task_id)
         return dispatched
 
+    def _preempt_victim(self, victim: Task, by: Task) -> None:
+        """抢占单个任务：一次性释放它占的机器人与**全部**作业区，重新排队。
+
+        调用方须持有锁；调用前已确认 victim.priority < by.priority。
+        """
+        self._release(victim)
+        victim.status = TaskStatus.READY
+        victim.error = f"preempted by {by.task_id}"
+        victim.blocked_resource = None
+        logger.info("preempt: task=%s preempts victim=%s zones=%s",
+                    by.task_id, victim.task_id, victim.required_zones)
+
     def _assign(self, task: Task, robot: Robot) -> None:
-        """原子地建立 任务<->机器人<->作业区 的占用关系。调用方须持有锁。"""
+        """原子地建立 任务<->机器人<->整组作业区 的占用关系。调用方须持有锁。
+
+        进入这里时所需作业区已被确认全部空闲（或已通过抢占清空），
+        因此一次性全部占上，不存在先占一半的中间态对外可见。
+        """
         task.status = TaskStatus.DISPATCHED
         task.robot_id = robot.robot_id
         task.error = None
+        task.blocked_resource = None
         robot.status = RobotStatus.BUSY
         robot.current_task = task.task_id
-        zone = self._store.zones.get(task.zone)
-        if zone is not None:
+        acquired: list[str] = []
+        for zid in task.required_zones:
+            zone = self._store.zones.get(zid)
+            if zone is None:
+                continue  # 未登记的区无需加锁，与单区时代一致
             zone.occupied_by = task.task_id
-        logger.info("task dispatched: %s -> robot=%s zone=%s",
-                    task.task_id, robot.robot_id, task.zone)
+            acquired.append(zid)
+        logger.info("task dispatched: %s -> robot=%s zones=%s",
+                    task.task_id, robot.robot_id, acquired)
 
-    def _release(self, task: Task, release_zone: bool = True) -> None:
-        """释放任务占用的机器人与作业区。调用方须持有锁。"""
+    def _release(self, task: Task, release_zones: bool = True) -> None:
+        """一次性释放任务占用的机器人与**全部**作业区。调用方须持有锁。
+
+        释放永远按"该任务当前声明的整组区 + 实际归属它的区"清理，
+        保证取消/抢占/失败/掉线时不会只放一部分、不留悬挂占用。
+        """
         if task.robot_id is not None:
             robot = self._store.robots.get(task.robot_id)
             if robot is not None and robot.current_task == task.task_id:
@@ -158,54 +189,39 @@ class Orchestrator:
                 if robot.status == RobotStatus.BUSY:
                     robot.status = RobotStatus.IDLE
             task.robot_id = None
-        if release_zone:
-            zone = self._store.zones.get(task.zone)
-            if zone is not None and zone.occupied_by == task.task_id:
-                zone.occupied_by = None
-
-    def _try_preempt(self, task: Task) -> bool:
-        """为 high 优先级任务抢占正在执行低优先级任务的机器人。调用方须持有锁。"""
-        candidates = []
-        for r in self._store.robots.values():
-            if r.status != RobotStatus.BUSY or r.current_task is None:
-                continue
-            if task.capability not in r.capabilities:
-                continue
-            victim = self._store.tasks[r.current_task]
-            if victim.priority < task.priority:
-                candidates.append((victim.priority, victim.task_id, r))
-        if not candidates:
-            return False
-        candidates.sort()
-        _, victim_id, robot = candidates[0]
-        victim = self._store.tasks[victim_id]
-        logger.info("preempt: task=%s preempts victim=%s on robot=%s",
-                    task.task_id, victim_id, robot.robot_id)
-        self._release(victim)
-        victim.status = TaskStatus.READY  # 重新排队等待再次派发
-        victim.error = f"preempted by {task.task_id}"
-        return True
+        if release_zones:
+            zone_ids = set(task.required_zones)
+            # 兜底：扫一遍所有区，把仍挂在该任务名下的也清掉
+            for zid, zone in self._store.zones.items():
+                if zone.occupied_by == task.task_id:
+                    zone_ids.add(zid)
+            for zid in zone_ids:
+                zone = self._store.zones.get(zid)
+                if zone is not None and zone.occupied_by == task.task_id:
+                    zone.occupied_by = None
 
     # ---- 生命周期 ----
     def pause_task(self, task_id: str) -> None:
-        """暂停执行中的任务：释放机器人回池，但保留作业区占用。"""
+        """暂停执行中的任务：释放机器人回池，但保留整组作业区占用。"""
         with self._store.lock:
             task = self._get_task(task_id)
             if task.status != TaskStatus.DISPATCHED:
                 return
-            self._release(task, release_zone=False)
+            self._release(task, release_zones=False)
             task.status = TaskStatus.PAUSED
-            logger.info("task paused: %s (zone %s kept)", task_id, task.zone)
+            logger.info("task paused: %s (zones %s kept)",
+                        task_id, task.required_zones)
 
     def resume_task(self, task_id: str) -> None:
-        """恢复暂停的任务：回到 READY 等待重新派发。"""
+        """恢复暂停的任务：放开保留的作业区，回到 READY 重新走整组原子派发。"""
         with self._store.lock:
             task = self._get_task(task_id)
             if task.status != TaskStatus.PAUSED:
                 return
-            zone = self._store.zones.get(task.zone)
-            if zone is not None and zone.occupied_by == task.task_id:
-                zone.occupied_by = None  # 重新走派发流程，由 _assign 重新占用
+            for zid in task.required_zones:
+                zone = self._store.zones.get(zid)
+                if zone is not None and zone.occupied_by == task.task_id:
+                    zone.occupied_by = None  # 重新走派发流程，由 _assign 重新整组占用
             task.status = TaskStatus.READY
             logger.info("task resumed: %s", task_id)
 
@@ -256,16 +272,25 @@ class Orchestrator:
                 logger.info("robot back online: %s", robot_id)
 
     def _rescue_current_task(self, robot: Robot, cause: str) -> None:
-        """机器人异常时，按任务既定策略重试或回退。调用方须持有锁。"""
+        """机器人异常时，一次性放开在执任务的机器人与整组作业区，再按策略处理。
+
+        调用方须持有锁。
+        """
         tid = robot.current_task
         robot.current_task = None
         if tid is None:
             return
         task = self._store.tasks[tid]
         task.robot_id = None
-        zone = self._store.zones.get(task.zone)
-        if zone is not None and zone.occupied_by == tid:
-            zone.occupied_by = None
+        # 整组作业区一次性释放（含兜底扫描，杜绝悬挂占用）
+        zone_ids = set(task.required_zones)
+        for zid, zone in self._store.zones.items():
+            if zone.occupied_by == tid:
+                zone_ids.add(zid)
+        for zid in zone_ids:
+            zone = self._store.zones.get(zid)
+            if zone is not None and zone.occupied_by == tid:
+                zone.occupied_by = None
         self._handle_failure(task, cause)
 
     def _handle_failure(self, task: Task, cause: str) -> None:

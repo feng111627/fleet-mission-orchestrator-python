@@ -37,6 +37,9 @@ class TaskIn(BaseModel):
     dependencies: list[str] = []
     fault_policy: FaultPolicy = FaultPolicy.RETRY
     max_retries: int = 2
+    # 多作业区任务：声明执行期间需要同时独占的一整组区；
+    # 省略或为空时退化为单区 [zone]，老用法不变。
+    zones: list[str] | None = None
 
 
 class GraphIn(BaseModel):
@@ -63,8 +66,16 @@ def register_zone(body: ZoneIn):
 @app.post("/graphs", status_code=201)
 def submit_graph(body: GraphIn):
     try:
-        ids = orch.submit_graph(body.idempotency_key,
-                                [Task(**t.model_dump()) for t in body.tasks])
+        tasks = []
+        for t in body.tasks:
+            data = t.model_dump()
+            # zones 省略时由 Task 退化为 [zone]；显式空列表视为非法
+            if data.get("zones") is not None and len(data["zones"]) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="zones must contain at least one zone id")
+            tasks.append(Task(**data))
+        ids = orch.submit_graph(body.idempotency_key, tasks)
     except DependencyCycleError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except OrchestratorError as e:
@@ -125,7 +136,9 @@ def state():
     with s.lock:
         return {
             "tasks": {t.task_id: {"status": t.status.value, "robot": t.robot_id,
-                                  "retries": t.retries, "error": t.error}
+                                  "zones": t.required_zones,
+                                  "retries": t.retries, "error": t.error,
+                                  "blocked_resource": t.blocked_resource}
                       for t in s.tasks.values()},
             "robots": {r.robot_id: {"status": r.status.value, "battery": r.battery,
                                     "current_task": r.current_task}
